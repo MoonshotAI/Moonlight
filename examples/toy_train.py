@@ -131,6 +131,8 @@ class Muon(torch.optim.Optimizer):
         params.extend(adamw_params)
         super().__init__(params, defaults)
         # Sort parameters into those for which we will use Muon, and those for which we will not
+        import pdb
+        pdb.set_trace()
         for p in muon_params:
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim == 2, p.ndim
@@ -239,20 +241,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_model_and_dataloader(model_name, dataset_name, hidden_size):
-    name2path = {
-        "openwebtext-100k": "Elriggs/openwebtext-100k",
-    }
-    train_dataset = load_dataset(name2path[dataset_name], trust_remote_code=True)
-    if model_name == "qwen":
-        tokenizer = Qwen2Tokenizer.from_pretrained(
-            "Qwen/Qwen2.5-0.5B", trust_remote_code=True
-        )
-    else:
-        assert 0, f"model {model_name} not supported"
-    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-
+def get_model(model_name, dataset_name, hidden_size):
     if model_name == "qwen":
         config = Qwen2Config(
             attention_dropout=0.0,
@@ -281,7 +270,24 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size):
         model = Qwen2ForCausalLM(config)
     else:
         assert 0, f"model {model_name} not supported"
-    return model, train_loader
+    return model
+
+
+def get_dataloader(model_name, dataset_name, hidden_size):
+    name2path = {
+        "openwebtext-100k": "Elriggs/openwebtext-100k",
+    }
+    train_dataset = load_dataset(name2path[dataset_name], trust_remote_code=True)
+    if model_name == "qwen":
+        tokenizer = Qwen2Tokenizer.from_pretrained(
+            "Qwen/Qwen2.5-0.5B", trust_remote_code=True
+        )
+    else:
+        assert 0, f"model {model_name} not supported"
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+    return train_loader
 
 
 def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
@@ -318,7 +324,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="qwen")
-    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--optimizer", type=str, default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="openwebtext-100k")
@@ -326,9 +332,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger.add(f"logs/train_{args.model}_{args.optimizer}_lr{args.lr}.log")
 
-    model, train_loader = get_model_and_dataloader(
-        args.model, args.dataset, args.hidden_size
-    )
+    model = get_model(args.model, args.dataset, args.hidden_size)
+    
     optimizer = get_optimizer(
         args.optimizer, model, lr=args.lr
     )
@@ -338,6 +343,8 @@ if __name__ == "__main__":
 
     model.train()
     epoch = 1
+    train_loader = get_dataloader(args.model, args.dataset, args.hidden_size)
+    
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=100,
