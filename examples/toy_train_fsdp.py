@@ -391,8 +391,6 @@ def fsdp_main(rank, world_size, args):
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="qwen")
     parser.add_argument("--optimizer", type=str, default="muon")
@@ -403,4 +401,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     WORLD_SIZE = torch.cuda.device_count()
     mp.spawn(fsdp_main, args=(WORLD_SIZE, args), nprocs=WORLD_SIZE, join=True)
-    # 2025-04-28 17:28:51.906 | INFO     | __mp_main__:fsdp_main:387 - Epoch: 0 Step: 0 LR: 1e-05 Training loss: 12.13530158996582
