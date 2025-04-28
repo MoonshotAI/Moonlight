@@ -11,7 +11,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from tqdm import tqdm
-
+from torch.utils.data.distributed import DistributedSampler
 
 class MoonDataset(Dataset):
     def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
@@ -282,9 +282,11 @@ def get_dataloader(model_name, dataset_name, hidden_size):
         )
     else:
         assert 0, f"model {model_name} not supported"
-    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
+    sampler = DistributedSampler(dataset=train_dataset, rank=0, num_replicas=1, shuffle=True)
+    kwargs = {'batch_size': 16, 'sampler': sampler, 'num_workers': 4, 'pin_memory': True}
+    train_loader = DataLoader(train_dataset, **kwargs)
     return train_loader
 
 
@@ -327,11 +329,8 @@ def main(args):
     model.to(device)
 
     model.train()
-    epoch = 1
+    epoch = 1  
     train_loader = get_dataloader(args.model, args.dataset, args.hidden_size)
-    # 13299
-    print('train data length:', len(train_loader))
-
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=100,

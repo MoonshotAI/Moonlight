@@ -139,8 +139,7 @@ def fsdp_main(rank, world_size, args):
     init_end_event = torch.cuda.Event(enable_timing=True)
 
     model = Net().to(rank)
-
-    model = DDP(model)
+    model = FSDP(model, auto_wrap_policy=my_auto_wrap_policy)
 
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 

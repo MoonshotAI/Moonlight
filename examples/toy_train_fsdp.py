@@ -1,14 +1,13 @@
+from loguru import logger
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 import os
 import math
 import torch
-from loguru import logger
-from datasets import load_dataset
 import argparse
 import torch.multiprocessing as mp
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
 import functools
-from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     Qwen2Config,
     Qwen2ForCausalLM,
@@ -16,49 +15,73 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from tqdm import tqdm
-from typing import Optional
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.tensor import distribute_tensor
-from torch.distributed.tensor import DTensor
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import torch.distributed as dist
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 
-def to_dist(x, from_local=False, **meta):
-    if from_local:
-        return DTensor.from_local(
-            x,
-            device_mesh=meta["device_mesh"],
-            placements=meta["placements"],
-            shape=meta["shape"],
-            stride=meta["stride"],
-        )
-    else:
-        return distribute_tensor(x,
-                                 device_mesh=meta["device_mesh"],
-                                 placements=meta["placements"])
+class MoonDataset(Dataset):
 
+    def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
+        self.dataset_name = dataset_name
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.texts = dataset["train"]["text"]
+        self.max_length = max_length
+        self.tokens = []
+        self._tokenize_texts()
 
-def to_local(x, keep_sharded=False):
-    if isinstance(x, DTensor):
-        meta = dict(
-            device_mesh=x.device_mesh,
-            placements=x.placements,
-            shape=x.shape,
-            stride=x.stride(),
-        )
-        if keep_sharded:
-            return x.to_local(), meta
+    def _tokenize_texts(self):
+        if os.path.exists(f"{self.dataset_name}.bin"):
+            self.tokens = torch.load(f"{self.dataset_name}.bin")
         else:
-            return x.full_tensor(), meta
+            for text in tqdm(self.texts, desc="Tokenizing texts"):
+                encoded = self.tokenizer.encode(text, add_special_tokens=True)
+                self.tokens.extend(encoded)
+            torch.save(self.tokens, f"{self.dataset_name}.bin")
 
-    return x, None
+    def __len__(self):
+        return len(self.tokens) // self.max_length
+
+    def __getitem__(self, idx):
+        start_idx = idx * (self.max_length)
+        end_idx = start_idx + (self.max_length)
+        token_slice = self.tokens[start_idx:end_idx]
+        data = torch.tensor(token_slice, dtype=torch.long)
+        return data
+
+
+# This code snippet is a modified version adapted from the following GitHub repository:
+# https://github.com/KellerJordan/Muon/blob/master/muon.py
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = (b * A + c * A @ A
+             )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
 
 
 class Muon(torch.optim.Optimizer):
@@ -226,96 +249,63 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-class MoonDataset(Dataset):
-
-    def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
-        self.dataset_name = dataset_name
-        self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.texts = dataset["train"]["text"]
-        self.max_length = max_length
-        self.tokens = []
-        self._tokenize_texts()
-
-    def _tokenize_texts(self):
-        if os.path.exists(f"{self.dataset_name}.bin"):
-            print('loading tokenized data')
-            self.tokens = torch.load(f"{self.dataset_name}.bin")
-        else:
-            for text in tqdm(self.texts, desc="Tokenizing texts"):
-                encoded = self.tokenizer.encode(text, add_special_tokens=True)
-                self.tokens.extend(encoded)
-            torch.save(self.tokens, f"{self.dataset_name}.bin")
-
-    def __len__(self):
-        return len(self.tokens) // self.max_length
-
-    def __getitem__(self, idx):
-        start_idx = idx * (self.max_length)
-        end_idx = start_idx + (self.max_length)
-        token_slice = self.tokens[start_idx:end_idx]
-        data = torch.tensor(token_slice, dtype=torch.long)
-        return data
-
-
-# This code snippet is a modified version adapted from the following GitHub repository:
-# https://github.com/KellerJordan/Muon/blob/master/muon.py
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(0) > G.size(1):
-        X = X.T
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.T
-        B = (b * A + c * A @ A
-             )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
+def get_model_cpu(model_name, hidden_size):
+    if model_name == "qwen":
+        config = Qwen2Config(
+            attention_dropout=0.0,
+            bos_token_id=151643,
+            eos_token_id=151643,
+            hidden_act="silu",
+            hidden_size=hidden_size,
+            initializer_range=0.02,
+            intermediate_size=4864,
+            max_position_embeddings=513,
+            max_window_layers=12,
+            model_type="qwen2",
+            num_attention_heads=16,
+            num_hidden_layers=12,
+            num_key_value_heads=16,
+            rms_norm_eps=1e-06,
+            rope_theta=1000000.0,
+            sliding_window=1024,
+            tie_word_embeddings=True,
+            torch_dtype="bfloat16",
+            use_cache=True,
+            use_mrope=False,
+            use_sliding_window=False,
+            vocab_size=151936,
+        )
+        model = Qwen2ForCausalLM(config)
+    else:
+        assert 0, f"model {model_name} not supported"
+    return model
 
 
-def parse_args():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="qwen")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--wd", type=float, default=0.1)
-    parser.add_argument("--dataset", type=str, default="openwebtext-100k")
-    parser.add_argument("--hidden_size", type=int, default=1024)
-    parser.add_argument("--optimizer", type=str, default="muon")
-    parser.add_argument('--save-model',
-                        action='store_true',
-                        default=False,
-                        help='For Saving the current Model')
-    return parser.parse_args()
+def get_dataloader(model_name, dataset_name, rank, world_size):
+    name2path = {
+        "openwebtext-100k": "Elriggs/openwebtext-100k",
+    }
+    train_dataset = load_dataset(name2path[dataset_name],
+                                 trust_remote_code=True)
+    if model_name == "qwen":
+        tokenizer = Qwen2Tokenizer.from_pretrained("Qwen/Qwen2.5-0.5B",
+                                                   trust_remote_code=True)
+    else:
+        assert 0, f"model {model_name} not supported"
 
-
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-
-def cleanup():
-    dist.destroy_process_group()
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
+    sampler = DistributedSampler(dataset=train_dataset,
+                                 rank=rank,
+                                 num_replicas=world_size,
+                                 shuffle=True)
+    kwargs = {
+        'batch_size': 16,
+        'sampler': sampler,
+        'num_workers': 4,
+        'pin_memory': True
+    }
+    train_loader = DataLoader(train_dataset, **kwargs)
+    return train_loader
 
 
 def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
@@ -345,118 +335,72 @@ def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
         assert 0, "optimizer not supported"
 
 
-def get_train_loader(dataset_name, rank, world_size):
-    name2path = {
-        "openwebtext-100k": "Elriggs/openwebtext-100k",
-    }
-    train_dataset = load_dataset(name2path[dataset_name],
-                                 trust_remote_code=True)
-    tokenizer = Qwen2Tokenizer.from_pretrained("Qwen/Qwen2.5-0.5B",
-                                               trust_remote_code=True)
-    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
-    sampler = DistributedSampler(dataset=train_dataset,
-                                 rank=rank,
-                                 num_replicas=world_size,
-                                 shuffle=True)
-    kwargs = {
-        'batch_size': 16,
-        'sampler': sampler,
-        'num_workers': 4,
-        'pin_memory': True
-    }
-    train_loader = DataLoader(train_dataset, **kwargs)
-    return train_loader
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12365'
+
+    # initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 def fsdp_main(rank, world_size, args):
+
     print((rank, world_size))
     setup(rank, world_size)
+    model = get_model_cpu(args.model, args.hidden_size)
     my_auto_wrap_policy = functools.partial(size_based_auto_wrap_policy,
                                             min_num_params=100)
     torch.cuda.set_device(rank)
-    # load model
-    config = Qwen2Config(
-        attention_dropout=0.0,
-        bos_token_id=151643,
-        eos_token_id=151643,
-        hidden_act="silu",
-        hidden_size=1024,
-        initializer_range=0.02,
-        intermediate_size=4864,
-        max_position_embeddings=513,
-        max_window_layers=12,
-        model_type="qwen2",
-        num_attention_heads=16,
-        num_hidden_layers=12,
-        num_key_value_heads=16,
-        rms_norm_eps=1e-06,
-        rope_theta=1000000.0,
-        sliding_window=1024,
-        tie_word_embeddings=True,
-        torch_dtype="bfloat16",
-        use_cache=True,
-        use_mrope=False,
-        use_sliding_window=False,
-        vocab_size=151936,
-    )
-    model = Qwen2ForCausalLM(config)
-    optimizer = get_optimizer(args.optimizer, model, lr=args.lr, wd=args.wd)
-    model = model.to(rank)
+    model.to(rank)
     model = FSDP(model, auto_wrap_policy=my_auto_wrap_policy)
     model.train()
+    optimizer = get_optimizer(args.optimizer, model, lr=args.lr)
 
-    train_loader = get_train_loader(args.dataset, rank, world_size)
     epoch = 1
+    train_loader = get_dataloader(args.model, args.dataset, rank, world_size)
+    logger.info(('train data length:', len(train_loader)))
+
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=100,
         num_training_steps=len(train_loader) * epoch,
         num_cycles=0.5,
     )
-
     for epoch in range(epoch):
-        total_loss = torch.zeros(1, device=rank)
         for step, batch in enumerate(train_loader):
             batch = batch.to(rank)
             input_ids = batch
-            output = model(input_ids=input_ids, labels=input_ids)
-            loss = output.loss
+
+            outputs = model(input_ids=input_ids, labels=input_ids)
+            loss = outputs.loss
             loss.backward()
 
-            # Synchronize the loss across all processes
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-            avg_loss = loss.item() / world_size  # 计算平均损失
-
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-
-            # Log the average loss only on the main process (rank 0)
             if rank == 0:
                 logger.info(
-                    f"Epoch: {epoch} Step: {step} LR: {optimizer.param_groups[0]['lr']} Training loss: {avg_loss}"
+                    f"Epoch: {epoch} Step: {step} LR: {optimizer.param_groups[0]['lr']} Training loss: {loss.item()}"
                 )
-            # Update total_loss for logging purposes
-            total_loss += avg_loss
-
-    if args.save_model:
-        # use a barrier to make sure training is done on all ranks
-        dist.barrier()
-        states = model.state_dict()
-        if rank == 0:
-            torch.save(states, "mnist_cnn.pt")
-
     cleanup()
 
 
-if __name__ == '__main__':
-    # Training settings
-    args = parse_args()
+if __name__ == "__main__":
+    import argparse
 
-    fsdp_main(0, 1, args)
-
-    # WORLD_SIZE = torch.cuda.device_count()
-    # mp.spawn(fsdp_main,
-    #     args=(WORLD_SIZE, args),
-    #     nprocs=WORLD_SIZE,
-    #     join=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="qwen")
+    parser.add_argument("--optimizer", type=str, default="muon")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--wd", type=float, default=0.1)
+    parser.add_argument("--dataset", type=str, default="openwebtext-100k")
+    parser.add_argument("--hidden_size", type=int, default=1024)
+    args = parser.parse_args()
+    WORLD_SIZE = torch.cuda.device_count()
+    mp.spawn(fsdp_main, args=(WORLD_SIZE, args), nprocs=WORLD_SIZE, join=True)
+    # 2025-04-28 17:28:51.906 | INFO     | __mp_main__:fsdp_main:387 - Epoch: 0 Step: 0 LR: 1e-05 Training loss: 12.13530158996582

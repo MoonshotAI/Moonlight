@@ -4,6 +4,15 @@ import torch
 from loguru import logger
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from torch.utils.data.distributed import DistributedSampler
+import os
+import math
+import torch
+import argparse
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+import functools
 from transformers import (
     Qwen2Config,
     Qwen2ForCausalLM,
@@ -11,7 +20,18 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from tqdm import tqdm
+from typing import Optional
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.tensor import distribute_tensor
+from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+import torch.distributed as dist
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
 
 class MoonDataset(Dataset):
     def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
@@ -271,7 +291,7 @@ def get_model(model_name, dataset_name, hidden_size):
     return model
 
 
-def get_dataloader(model_name, dataset_name, hidden_size):
+def get_dataloader(model_name, dataset_name, rank, world_size):
     name2path = {
         "openwebtext-100k": "Elriggs/openwebtext-100k",
     }
@@ -282,9 +302,11 @@ def get_dataloader(model_name, dataset_name, hidden_size):
         )
     else:
         assert 0, f"model {model_name} not supported"
-    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
+    sampler = DistributedSampler(dataset=train_dataset, rank=rank, num_replicas=world_size, shuffle=True)
+    kwargs = {'batch_size': 16, 'sampler': sampler, 'num_workers': 4, 'pin_memory': True}
+    train_loader = DataLoader(train_dataset, **kwargs)
     return train_loader
 
 
@@ -316,9 +338,27 @@ def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
     else:
         assert 0, "optimizer not supported"
 
-def main(args):
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def fsdp_main(rank, world_size, args):
+    print((rank, world_size))
+    setup(rank, world_size)
     model = get_model(args.model, args.dataset, args.hidden_size)
-    
+    model = model.to(rank)
+    my_auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=100
+    )
+    model = FSDP(model, auto_wrap_policy=my_auto_wrap_policy)
+    model.train()
+
     optimizer = get_optimizer(
         args.optimizer, model, lr=args.lr
     )
@@ -328,10 +368,8 @@ def main(args):
 
     model.train()
     epoch = 1
-    train_loader = get_dataloader(args.model, args.dataset, args.hidden_size)
-    # 13299
-    print('train data length:', len(train_loader))
-
+    train_loader = get_dataloader(args.model, args.dataset, rank, world_size)
+    
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=100,
@@ -348,9 +386,10 @@ def main(args):
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            logger.info(
-                f"Epoch: {epoch} Step: {step} LR: {optimizer.param_groups[0]['lr']} Training loss: {loss.item()}"
-            )
+            if rank == 0:
+                logger.info(
+                    f"Epoch: {epoch} Step: {step} LR: {optimizer.param_groups[0]['lr']} Training loss: {loss.item()}"
+                )
 
 
 if __name__ == "__main__":
@@ -365,5 +404,4 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=1024)
     args = parser.parse_args()
     logger.add(f"logs/train_{args.model}_{args.optimizer}_lr{args.lr}.log")
-    main(args=args)
-    
+    fsdp_main(rank=0, world_size=1, args=args)
