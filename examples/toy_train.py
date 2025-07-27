@@ -171,7 +171,7 @@ class Muon(torch.optim.Optimizer):
             wd = group["wd"]
             momentum = group["momentum"]
 
-            # generate weight updates in distributed fashion
+            # generate weight updates
             for p in params:
                 # sanity check
                 g = p.grad
